@@ -21,7 +21,15 @@ from cryptography.x509 import ObjectIdentifier
 from requests_toolbelt.multipart import decoder
 from requests_ntlm import HttpNtlmAuth
 from requests_kerberos import HTTPKerberosAuth, REQUIRED, DISABLED
-from impacket.examples.getTGT import GETTGT
+from binascii import unhexlify
+
+import impacket
+from impacket import version
+from impacket.examples import logger
+from impacket.examples.utils import parse_credentials
+from impacket.krb5.kerberosv5 import getKerberosTGT
+from impacket.krb5 import constants
+from impacket.krb5.types import Principal
 
 # Who needs just 1 date format :/
 dateFormat1 = "%Y-%m-%dT%H:%M:%SZ"
@@ -37,6 +45,34 @@ msgHeader = """<Msg ReplyCompression="zlib" SchemaVersion="1.1"><Body Type="Byte
 msgHeaderPolicy = """<Msg ReplyCompression="zlib" SchemaVersion="1.1"><Body Type="ByteRange" Length="{bodylength}" Offset="0" /><CorrelationID>{{00000000-0000-0000-0000-000000000000}}</CorrelationID><Hooks><Hook2 Name="clientauth"><Property Name="AuthSenderMachine">{client}</Property><Property Name="PublicKey">{publickey}</Property><Property Name="ClientIDSignature">{clientIDsignature}</Property><Property Name="PayloadSignature">{payloadsignature}</Property><Property Name="ClientCapabilities">NonSSL</Property><Property Name="HashAlgorithm">1.2.840.113549.1.1.11</Property></Hook2><Hook3 Name="zlib-compress" /></Hooks><ID>{{041A35B4-DCEE-4F64-A978-D4D489F47D28}}</ID><Payload Type="inline" /><Priority>0</Priority><Protocol>http</Protocol><ReplyMode>Sync</ReplyMode><ReplyTo>direct:{client}:SccmMessaging</ReplyTo><SentTime>{date}</SentTime><SourceID>GUID:{clientid}</SourceID><SourceHost>{client}</SourceHost><TargetAddress>mp:MP_PolicyManager</TargetAddress><TargetEndpoint>MP_PolicyManager</TargetEndpoint><TargetHost>{sccmserver}</TargetHost><Timeout>60000</Timeout></Msg>"""
 policyBody = """<RequestAssignments SchemaVersion="1.00" ACK="false" RequestType="Always"><Identification><Machine><ClientID>GUID:{clientid}</ClientID><FQDN>{clientfqdn}</FQDN><NetBIOSName>{client}</NetBIOSName><SID /></Machine><User /></Identification><PolicySource>SMS:PRI</PolicySource><Resource ResourceType="Machine" /><ServerCookie /></RequestAssignments>"""
 reportBody = """<Report><ReportHeader><Identification><Machine><ClientInstalled>0</ClientInstalled><ClientType>1</ClientType><ClientID>GUID:{clientid}</ClientID><ClientVersion>5.00.8325.0000</ClientVersion><NetBIOSName>{client}</NetBIOSName><CodePage>850</CodePage><SystemDefaultLCID>2057</SystemDefaultLCID><Priority /></Machine></Identification><ReportDetails><ReportContent>Inventory Data</ReportContent><ReportType>Full</ReportType><Date>{date}</Date><Version>1.0</Version><Format>1.1</Format></ReportDetails><InventoryAction ActionType="Predefined"><InventoryActionID>{{00000000-0000-0000-0000-000000000003}}</InventoryActionID><Description>Discovery</Description><InventoryActionLastUpdateTime>{date}</InventoryActionLastUpdateTime></InventoryAction></ReportHeader><ReportBody /></Report>"""
+
+class GETTGT:
+    def __init__(self, target, password, domain, options):
+        self.__password = password
+        self.__user= target
+        self.__domain = domain
+        self.__lmhash = ''
+        self.__nthash = ''
+        self.__aesKey = options.aesKey
+        self.__options = options
+        self.__kdcHost = options.dc_ip
+        if options.hashes is not None:
+            self.__lmhash, self.__nthash = options.hashes.split(':')
+
+    def saveTicket(self, ticket, sessionKey):
+        logging.info('Saving ticket in %s' % (self.__user + '.ccache'))
+        from impacket.krb5.ccache import CCache
+        ccache = CCache()
+
+        ccache.fromTGT(ticket, sessionKey, sessionKey)
+        ccache.saveFile(self.__user + '.ccache')
+
+    def run(self):
+        userName = Principal(self.__user, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+        tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(userName, self.__password, self.__domain,
+                                                                unhexlify(self.__lmhash), unhexlify(self.__nthash), self.__aesKey,
+                                                                self.__kdcHost)
+        self.saveTicket(tgt, oldSessionKey)
 
 class Tools:
     @staticmethod
@@ -289,6 +325,23 @@ if __name__ == "__main__":
     parser.add_argument("password", action='store', help="Password for username")
     parser.add_argument("auth", action='store', help="Type of authentication to use, NTLM or TGT")
 
+    # from impacket getTGT arguments to pass in options to GETTGT
+    parser.add_argument('identity', action='store', help='[domain/]username[:password]')
+    parser.add_argument('-ts', action='store_true', help='Adds timestamp to every logging output')
+    parser.add_argument('-debug', action='store_true', help='Turn DEBUG output ON')
+
+    group = parser.add_argument_group('authentication')
+
+    group.add_argument('-hashes', action="store", metavar="LMHASH:NTHASH", help='NTLM hashes, format is LMHASH:NTHASH')
+    group.add_argument('-no-pass', action="store_true", help='don\'t ask for password (useful for -k)')
+    group.add_argument('-k', action="store_true",
+                       help='Use Kerberos authentication. Grabs credentials from ccache file '
+                            '(KRB5CCNAME) based on target parameters. If valid credentials cannot be found, it will use the '
+                            'ones specified in the command line')
+    group.add_argument('-aesKey', action="store", metavar="hex key", help='AES key to use for Kerberos Authentication '
+                                                                          '(128 or 256 bits)')
+    group.add_argument('-dc-ip', action='store', metavar="ip address", help='IP Address of the domain controller. If '
+                                                                            'ommited it use the domain part (FQDN) specified in the target parameter')
     args = parser.parse_args()
 
     target_name = args.spoof_name
@@ -305,7 +358,20 @@ if __name__ == "__main__":
         sys.exit()
 
     if auth.upper() == 'TGT':
-        tgt_saver = GETTGT(target_username, target_password, target_fqdn)
+        domain, username, password = parse_credentials(args.identity)
+
+        if domain is None:
+            print('Domain should be specified! in the identify field')
+            sys.exit(1)
+
+        if password == '' and username != '' and args.hashes is None and args.no_pass is False and args.aesKey is None:
+            from getpass import getpass
+            password = getpass("Password:")
+
+        if args.aesKey is not None:
+            args.k = True
+
+        tgt_saver = GETTGT(username, password, domain, args)
         tgt_saver.run()
         tgt_file = target_username + '.ccache'
         os.environ['KRB5CCNAME'] = tgt_file
